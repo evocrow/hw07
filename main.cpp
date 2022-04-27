@@ -8,7 +8,7 @@
 // 并行可以用 OpenMP 也可以用 TBB
 
 #include <iostream>
-//#include <x86intrin.h>  // _mm 系列指令都来自这个头文件
+#include <x86intrin.h>  // _mm 系列指令都来自这个头文件
 //#include <xmmintrin.h>  // 如果上面那个不行，试试这个
 #include "ndarray.h"
 #include "wangsrng.h"
@@ -25,10 +25,15 @@ static void matrix_randomize(Matrix &out) {
 
     // 这个循环为什么不够高效？如何优化？ 10 分
 #pragma omp parallel for collapse(2)
-    for (int x = 0; x < nx; x++) {
-        for (int y = 0; y < ny; y++) {
-            float val = wangsrng(x, y).next_float();
-            out(x, y) = val;
+    for (int y = 0; y < ny; y++) {
+        for (int x = 0; x < nx; x += 4) {
+            float val[4];
+            for (int offset = 0; offset < 4; offset++) {
+                val[offset] = wangsrng(x+offset, y).next_float();
+            }
+            for (int offset = 0; offset < 4; offset++) {
+                _mm_stream_si32((int *)&out(x+offset, y), (int &)val[offset]);
+            }    
         }
     }
     TOCK(matrix_randomize);
@@ -41,10 +46,15 @@ static void matrix_transpose(Matrix &out, Matrix const &in) {
     out.reshape(ny, nx);
 
     // 这个循环为什么不够高效？如何优化？ 15 分
+    constexpr int blockSize = 32;
 #pragma omp parallel for collapse(2)
-    for (int x = 0; x < nx; x++) {
-        for (int y = 0; y < ny; y++) {
-            out(y, x) = in(x, y);
+    for (int yBase = 0; yBase < ny; yBase += blockSize) {
+        for (int xBase = 0; xBase < nx; xBase += blockSize) {
+            for (int y = yBase; y < yBase + blockSize; y++) {
+                for (int x = xBase; x < xBase + blockSize; x++) {
+                    _mm_stream_si32((int *)&out(x, y), (int &)in(y, x));
+                }
+            }
         }
     }
     TOCK(matrix_transpose);
@@ -62,12 +72,15 @@ static void matrix_multiply(Matrix &out, Matrix const &lhs, Matrix const &rhs) {
     out.reshape(nx, ny);
 
     // 这个循环为什么不够高效？如何优化？ 15 分
+    constexpr int blockSize = 32;
 #pragma omp parallel for collapse(2)
     for (int y = 0; y < ny; y++) {
-        for (int x = 0; x < nx; x++) {
-            out(x, y) = 0;  // 有没有必要手动初始化？ 5 分
+        for (int xBase = 0; xBase < nx; xBase += blockSize) {
+            // 有没有必要手动初始化？ 5 分
             for (int t = 0; t < nt; t++) {
-                out(x, y) += lhs(x, t) * rhs(t, y);
+                for (int x = xBase; x < xBase + blockSize; x++) {
+                    out(x, y) += lhs(x, t) * rhs(t, y);
+                }
             }
         }
     }
@@ -78,7 +91,9 @@ static void matrix_multiply(Matrix &out, Matrix const &lhs, Matrix const &rhs) {
 static void matrix_RtAR(Matrix &RtAR, Matrix const &R, Matrix const &A) {
     TICK(matrix_RtAR);
     // 这两个是临时变量，有什么可以优化的？ 5 分
-    Matrix Rt, RtA;
+    static thread_local Matrix Rt, RtA;
+    Rt.reshape(R.shape());
+    RtA.reshape(R.shape());
     matrix_transpose(Rt, R);
     matrix_multiply(RtA, Rt, A);
     matrix_multiply(RtAR, RtA, R);
